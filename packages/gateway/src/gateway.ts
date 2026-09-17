@@ -7,7 +7,13 @@
 import { createHash } from 'node:crypto';
 import { checkOutputLanguage, toNfcText } from '@yeonjae/prose';
 import { uuidv7, validatorFor, type Uuid } from '@yeonjae/domain';
-import { classifyProviderFailure, isRetryable, type FailureClass } from './failures.js';
+import {
+  classifyProviderFailure,
+  isCancellation,
+  isRetryable,
+  ProviderFailure,
+  type FailureClass,
+} from './failures.js';
 import { guardRequest, type GuardContext } from './guard.js';
 import { DEFAULT_PARAMS } from './mock-provider.js';
 import {
@@ -67,7 +73,8 @@ export interface AuditRecord {
   readonly cost_cents: number;
   readonly latency_ms: number;
   readonly attempt: number;
-  readonly status: 'succeeded' | 'failed' | 'fallback_succeeded' | 'budget_blocked';
+  /** `cancelled` is a distinct terminal status (B-4-7): the operator stopped this, it did not break. */
+  readonly status: 'succeeded' | 'failed' | 'fallback_succeeded' | 'budget_blocked' | 'cancelled';
   readonly finish_reason: FinishReason;
   readonly schema_valid: boolean;
   readonly repair_attempts: number;
@@ -83,12 +90,27 @@ export interface AuditRecord {
         readonly attempt: number;
         readonly model_id: string;
         readonly provider: string;
-        readonly outcome: 'succeeded' | 'failed';
+        readonly outcome: 'succeeded' | 'failed' | 'cancelled';
         readonly failure_class?: string | undefined;
         readonly error_class?: string | undefined;
         readonly cost_cents: number;
         readonly usage: ProviderResponse['usage'];
+        /**
+         * Whether `usage` was actually reported (B-4-7). False on an abort whose response we never saw,
+         * so an aborted attempt is never mistaken for a proven-free one.
+         */
+        readonly usage_known?: boolean | undefined;
         readonly latency_ms: number;
+        /** Present only on a cancelled attempt: local abort versus confirmed remote stop. */
+        readonly cancellation?:
+          | {
+              readonly local_aborted: boolean;
+              readonly remote_state: 'confirmed' | 'unknown';
+              readonly possibly_completed?: boolean | undefined;
+            }
+          | undefined;
+        /** True when a response arrived but was discarded because cancellation was already authoritative. */
+        readonly discarded_response?: boolean | undefined;
       }[]
     | undefined;
   /** Prompt and output text are never logged in plaintext; only hashes and sizes live on the record. */
@@ -105,9 +127,20 @@ export interface AuditStore {
 
 export class MemoryAuditStore implements AuditStore {
   readonly records: AuditRecord[] = [];
+  /**
+   * Only a SUCCEEDED call is replayable, stated as an allowlist rather than a deny-list.
+   *
+   * The deny-list form (`!== 'failed' && !== 'budget_blocked'`) silently admitted every status added
+   * afterwards — including `cancelled` (B-4-7), which would have let a cancelled call be replayed as a
+   * completed one and its discarded response promoted into an artifact on resume. The Postgres store
+   * already used an allowlist (`status IN ('succeeded','fallback_succeeded')`), so this also removes a
+   * behavioural divergence between the two implementations.
+   */
   async findByIdempotencyKey(key: string): Promise<AuditRecord | undefined> {
     return this.records.find(
-      (r) => r.idempotency_key === key && r.status !== 'failed' && r.status !== 'budget_blocked',
+      (r) =>
+        r.idempotency_key === key &&
+        (r.status === 'succeeded' || r.status === 'fallback_succeeded'),
     );
   }
   async append(record: AuditRecord): Promise<void> {
@@ -164,6 +197,41 @@ function costCents(route: RouteEntry, usage: ProviderResponse['usage']): number 
   );
 }
 
+/**
+ * One cancelled provider attempt, recorded truthfully.
+ *
+ * `local_aborted` is what we can always prove. `remote_state` is `confirmed` ONLY when the adapter said
+ * so; otherwise it is `unknown`, because abandoning our request is not evidence that the model stopped
+ * computing or that the vendor will not bill for it. `usage_known` is false unless the adapter handed us
+ * usage, so no reader can mistake an abort for a free call.
+ */
+function cancelledAttempt(
+  attempt: number,
+  route: RouteEntry,
+  err: unknown,
+): NonNullable<AuditRecord['attempt_records']>[number] {
+  const failure = err instanceof ProviderFailure ? err : undefined;
+  const confirmed = failure?.detail.remoteCancelConfirmed === true;
+  const usage = failure?.detail.usage;
+  return {
+    attempt,
+    model_id: route.modelId,
+    provider: route.provider,
+    outcome: 'cancelled',
+    failure_class: 'cancelled_local_abort',
+    error_class: 'CANCELLED',
+    cost_cents: 0,
+    usage: usage ?? { input: 0, output: 0, cached: 0 },
+    usage_known: usage !== undefined,
+    latency_ms: 0,
+    cancellation: {
+      local_aborted: true,
+      remote_state: confirmed ? ('confirmed' as const) : ('unknown' as const),
+      ...(failure?.detail.possiblyCompleted ? { possibly_completed: true } : {}),
+    },
+  };
+}
+
 export class Gateway {
   constructor(private readonly opts: GatewayOptions) {}
 
@@ -176,6 +244,19 @@ export class Gateway {
     // 0. idempotency: a completed call is replayed, never re-spent
     const prior = await this.opts.audit.findByIdempotencyKey(req.idempotencyKey);
     if (prior) return this.fromAudit(prior, true);
+
+    /**
+     * 0a. CANCELLATION IS CHECKED BEFORE ANY SPEND (B-4-7).
+     *
+     * An already-aborted signal must not reach a provider at all: the cheapest correct behaviour for a
+     * cancelled job is zero provider invocations. The call is still audited, because "we refused to spend
+     * on a cancelled job" is history an operator needs, and a cancelled row must never be replayable as a
+     * completed call.
+     */
+    if (req.signal?.aborted) {
+      await this.auditCancelled(req, []);
+      throw new GatewayError('CANCELLED', 'cancelled before any provider request was dispatched');
+    }
 
     // 1. Guard (fail closed)
     const guard = guardRequest(req, this.opts.guardContext);
@@ -233,25 +314,52 @@ export class Gateway {
         const provider = this.opts.providers.get(route.provider);
         if (!provider)
           throw new GatewayError('PROVIDER_FAILED', `provider ${route.provider} not configured`);
+        // Cancellation observed between attempts: a new attempt after cancellation is forbidden, so the
+        // retry/repair/fallback loop stops here rather than at the next ordinary step boundary.
+        if (req.signal?.aborted) {
+          await this.auditCancelled(req, attemptRecords);
+          throw new GatewayError('CANCELLED', `cancelled before attempt ${String(attempt + 1)}`);
+        }
         attempt++;
         let res: ProviderResponse;
         try {
-          res = await provider.complete({
-            modelId: route.modelId,
-            system: req.pack.renderedSystem,
-            user: req.pack.renderedUser,
-            params,
-            trace: {
-              role: req.role,
-              activityId: req.activityId,
-              idempotencyKey: req.idempotencyKey,
+          res = await provider.complete(
+            {
+              modelId: route.modelId,
+              system: req.pack.renderedSystem,
+              user: req.pack.renderedUser,
+              params,
+              trace: {
+                role: req.role,
+                activityId: req.activityId,
+                idempotencyKey: req.idempotencyKey,
+              },
             },
-          });
+            req.signal,
+          );
         } catch (err) {
           // Fallback is authorized ONLY for a policy-retryable failure. A rejected request, an auth
           // failure, a content refusal or an unrecognized fault stops here: re-sending the same bytes to
           // the next paid model would multiply spend without any prospect of a different answer.
           const failureClass = classifyProviderFailure(err);
+          /**
+           * A cancelled attempt is TERMINAL and is recorded as cancelled, not failed.
+           *
+           * Three things must not happen here, and each of them would be a silent policy violation:
+           * retrying the same route, rerouting to the next paid model, and reporting the attempt as a
+           * provider failure. The last matters for accounting as much as the first two — a cancelled
+           * attempt whose usage we never saw is `usage_known: false`, because the vendor may have billed
+           * for work we abandoned, and recording zero would be a false zero-cost claim.
+           */
+          if (isCancellation(failureClass) || req.signal?.aborted) {
+            attemptRecords.push(cancelledAttempt(attempt, route, err));
+            await this.auditCancelled(req, attemptRecords);
+            await reservation.release(actualCost);
+            throw new GatewayError(
+              'CANCELLED',
+              `cancelled during attempt ${String(attempt)} [failure_class=cancelled_local_abort]`,
+            );
+          }
           lastFailureClass = failureClass;
           lastError = {
             class: 'PROVIDER_FAILED',
@@ -272,6 +380,28 @@ export class Gateway {
           fallbackFrom = route.modelId;
           routeIdx++;
           continue;
+        }
+        /**
+         * The response arrived, but cancellation may have become authoritative while it was in flight.
+         * A late success is DISCARDED: promoting it would let a cancelled job produce a workflow artifact
+         * and, through the idempotency path, present as a completed call on resume. Its usage IS known
+         * here, so it is accounted as a cancelled-but-billable attempt rather than as free.
+         */
+        if (req.signal?.aborted) {
+          attemptRecords.push({
+            ...cancelledAttempt(attempt, route, undefined),
+            cost_cents: costCents(route, res.usage),
+            usage: res.usage,
+            usage_known: true,
+            latency_ms: res.latencyMs,
+            discarded_response: true,
+          });
+          await this.auditCancelled(req, attemptRecords);
+          await reservation.release(actualCost + costCents(route, res.usage));
+          throw new GatewayError(
+            'CANCELLED',
+            `cancelled while attempt ${String(attempt)} was in flight; response discarded`,
+          );
         }
         const attemptCost = costCents(route, res.usage);
         actualCost += attemptCost;
@@ -418,6 +548,48 @@ export class Gateway {
       }
       throw err;
     }
+  }
+
+  /**
+   * The audit row for a cancelled call, and the single place that decides what "cancelled" means.
+   *
+   * It is deliberately its own status rather than `failed`: an operator reading history must be able to
+   * distinguish "we stopped this" from "the provider broke", and `findByIdempotencyKey` only ever replays
+   * `succeeded`/`fallback_succeeded`, so a cancelled row can never be resurrected as a completed call on
+   * resume. No output is stored, because a discarded response must not become an artifact.
+   */
+  private async auditCancelled(
+    req: GatewayRequest,
+    attemptRecords: AuditRecord['attempt_records'],
+  ): Promise<void> {
+    const routes = this.routesFor(req.modelClass);
+    const route = routes[0];
+    if (!route) return;
+    const params: ModelParams = { ...DEFAULT_PARAMS, ...(req.params ?? {}) };
+    // Cost is the sum of what the attempts THEMSELVES recorded. An abort with unknown usage contributes
+    // zero here while carrying `usage_known: false`, so a reader can tell "nothing billed" from
+    // "billing unknown" rather than seeing a bare zero.
+    const cost = (attemptRecords ?? []).reduce((sum, a) => sum + a.cost_cents, 0);
+    await this.opts.audit.append(
+      this.record(
+        req,
+        guardRequest(req, this.opts.guardContext),
+        route,
+        params,
+        undefined,
+        cost,
+        'cancelled',
+        'error',
+        false,
+        0,
+        { class: 'CANCELLED', message: 'job cancellation observed' },
+        undefined,
+        undefined,
+        undefined,
+        (attemptRecords ?? []).length || 1,
+        attemptRecords,
+      ),
+    );
   }
 
   private record(

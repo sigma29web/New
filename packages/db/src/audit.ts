@@ -266,7 +266,8 @@ export interface GatewayAuditLike {
   cost_cents: number;
   latency_ms: number;
   attempt: number;
-  status: 'succeeded' | 'failed' | 'fallback_succeeded' | 'budget_blocked';
+  /** `cancelled` is a distinct terminal status (B-4-7): the operator stopped this, it did not break. */
+  status: 'succeeded' | 'failed' | 'fallback_succeeded' | 'budget_blocked' | 'cancelled';
   finish_reason: 'stop' | 'length' | 'content_filter' | 'error';
   schema_valid: boolean;
   repair_attempts: number;
@@ -278,7 +279,7 @@ export interface GatewayAuditLike {
         readonly attempt: number;
         readonly model_id: string;
         readonly provider: string;
-        readonly outcome: 'succeeded' | 'failed';
+        readonly outcome: 'succeeded' | 'failed' | 'cancelled';
         readonly failure_class?: string | undefined;
         readonly error_class?: string | undefined;
         readonly cost_cents: number;
@@ -287,7 +288,23 @@ export interface GatewayAuditLike {
           readonly output: number;
           readonly cached: number;
         };
+        /**
+         * Whether `usage` was actually reported (B-4-7). False on an abort whose response we never saw,
+         * so an aborted attempt is never mistaken for a proven-free one: unknown billing is recorded as
+         * unknown rather than inferred to be zero.
+         */
+        readonly usage_known?: boolean | undefined;
         readonly latency_ms: number;
+        /** Present only on a cancelled attempt. Distinguishes local abort from confirmed remote stop. */
+        readonly cancellation?:
+          | {
+              readonly local_aborted: boolean;
+              readonly remote_state: 'confirmed' | 'unknown';
+              readonly possibly_completed?: boolean | undefined;
+            }
+          | undefined;
+        /** True when a response arrived but was discarded because cancellation was already authoritative. */
+        readonly discarded_response?: boolean | undefined;
       }[]
     | undefined;
   input_hash: string;

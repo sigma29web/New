@@ -22,7 +22,14 @@ export type FailureClass =
   /** The request itself is wrong (4xx, bad schema, content refusal, auth). Fallback is NOT authorized. */
   | 'non_retryable_request'
   /** Anything unrecognized. Treated as non-retryable so an unknown fault cannot multiply spend. */
-  | 'non_retryable_unknown';
+  | 'non_retryable_unknown'
+  /**
+   * The caller abandoned the request (B-4-7). NOT a provider fault and never retryable: an operator who
+   * cancelled a job has not asked for the same bytes to be sent to a second paid model. Kept separate
+   * from every `non_retryable_*` class so accounting and operator surfaces can tell a deliberate stop
+   * from a refusal.
+   */
+  | 'cancelled_local_abort';
 
 export const RETRYABLE_CLASSES: readonly FailureClass[] = [
   'retryable_transport',
@@ -48,6 +55,14 @@ export class ProviderFailure extends Error {
       readonly providerRequestId?: string | undefined;
       /** True when the provider may have completed the work even though we never saw the response. */
       readonly possiblyCompleted?: boolean | undefined;
+      /**
+       * Set ONLY when the vendor affirmatively acknowledged cancellation. Absent or false means the
+       * remote state is unknown: we abandoned our request, which is not evidence the model stopped.
+       */
+      readonly remoteCancelConfirmed?: boolean | undefined;
+      /** Usage the provider reported despite the abort, when it reports any. Absent = unknown, not zero. */
+      readonly usage?:
+        { readonly input: number; readonly output: number; readonly cached: number } | undefined;
     } = {},
   ) {
     super(message);
@@ -55,8 +70,27 @@ export class ProviderFailure extends Error {
   }
 }
 
+/** True for the one class that means "the caller stopped this", not "the provider misbehaved". */
+export function isCancellation(cls: FailureClass): boolean {
+  return cls === 'cancelled_local_abort';
+}
+
+/**
+ * Whether a thrown error is a cancellation from any source: our own typed verdict, or the platform's
+ * `AbortError` shape that a `fetch`-based adapter produces when its signal aborts.
+ */
+export function isCancellationError(err: unknown): boolean {
+  if (err instanceof ProviderFailure) return isCancellation(err.failureClass);
+  if (err instanceof Error && err.name === 'AbortError') return true;
+  return false;
+}
+
+// NOTE: "aborted" is deliberately NOT a transport marker. An aborted request is a cancellation (B-4-7),
+// and classifying it as `retryable_transport` would authorize fallback — re-sending the bytes of a job the
+// operator just cancelled to a second paid model.
 const TRANSPORT =
-  /\b(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|EAI_AGAIN|ENOTFOUND|socket hang up|network|fetch failed|aborted)\b/i;
+  /\b(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|EAI_AGAIN|ENOTFOUND|socket hang up|network|fetch failed)\b/i;
+const CANCELLED = /\b(abort|aborted|aborterror|canceled|cancelled|operation was aborted)\b/i;
 const TIMEOUT = /\b(timeout|timed out|deadline exceeded)\b/i;
 const THROTTLE = /\b(rate.?limit|too many requests|429|quota exceeded|overloaded)\b/i;
 const SERVER =
@@ -70,6 +104,9 @@ const REQUEST =
  */
 export function classifyProviderFailure(err: unknown): FailureClass {
   if (err instanceof ProviderFailure) return err.failureClass;
+  // A platform AbortError is a cancellation whatever else its message resembles. Checked before status
+  // and shape so no later rule can promote it into a retryable class.
+  if (err instanceof Error && err.name === 'AbortError') return 'cancelled_local_abort';
 
   const status = numericStatus(err);
   if (status !== undefined) {
@@ -87,6 +124,7 @@ export function classifyProviderFailure(err: unknown): FailureClass {
 
   // A rejected request is checked FIRST: "invalid request" must not be rerouted just because the vendor's
   // message happens to contain a word that also appears in a transport fault.
+  if (CANCELLED.test(text)) return 'cancelled_local_abort';
   if (REQUEST.test(text)) return 'non_retryable_request';
   if (THROTTLE.test(text)) return 'retryable_throttled';
   if (SERVER.test(text)) return 'retryable_provider';

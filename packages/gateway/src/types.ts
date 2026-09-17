@@ -39,6 +39,13 @@ export interface GatewayRequest {
   readonly outputSchemaRef?: string | undefined;
   readonly params?: Partial<ModelParams> | undefined;
   readonly modelClass: ModelClass;
+  /**
+   * Cancellation for THIS call (B-4-7). When it aborts, the in-flight provider request is abandoned and
+   * the call settles `CANCELLED` — it is never retried, rerouted or repaired, because operator
+   * cancellation is an intent rather than a transient outage. Optional so every existing caller and
+   * adapter keeps working unchanged.
+   */
+  readonly signal?: AbortSignal | undefined;
 }
 
 export interface ModelParams {
@@ -74,7 +81,14 @@ export interface ProviderRequest {
     | undefined;
 }
 
-/** Every provider adapter implements exactly this; SDK types never leave the adapter. */
+/**
+ * Every provider adapter implements exactly this; SDK types never leave the adapter.
+ *
+ * `signal` is the caller's cancellation (B-4-7). An adapter that can pass it to its transport SHOULD, and
+ * should reject with `ProviderFailure('cancelled_local_abort', …)`. An adapter that cannot prove the
+ * remote side stopped must not claim it did: the gateway records `remote_state: 'unknown'` unless the
+ * adapter reports `remoteCancelConfirmed`.
+ */
 export interface Provider {
   readonly name: string;
   complete(req: ProviderRequest, signal?: AbortSignal): Promise<ProviderResponse>;
@@ -111,7 +125,11 @@ export class GatewayError extends Error {
       | 'BUDGET_EXHAUSTED'
       | 'PROVIDER_FAILED'
       | 'SCHEMA_INVALID'
-      | 'TRUNCATED',
+      | 'TRUNCATED'
+      /** The operator cancelled the job while this call was pending or in flight (B-4-7). */
+      | 'CANCELLED'
+      /** Cancellation arrived after the work had already been atomically committed. */
+      | 'CANCELLED_TOO_LATE',
     message: string,
   ) {
     super(`${code}: ${message}`);
